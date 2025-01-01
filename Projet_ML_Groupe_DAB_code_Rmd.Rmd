@@ -1,0 +1,445 @@
+---
+title: "Projet ML- Construction de Véhiculier "
+output: html_document
+date: "2024-10-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+L'objectif de ce projet est de construire un véhiculier permettant de classer les véhicules du parc automobile en des groupes homogènes selon les fréquences de survenance de sinistres.
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+
+library(h2o)
+h2o.init()
+h2o.removeAll()
+```
+
+
+## Etape 0 : Compréhension des Données 
+
+ 
+#### Importation des Données
+
+
+```{r}
+df=read.csv("Motor vehicle insurance data.csv", sep=";")
+```
+
+```{r}
+head(df,10)
+```
+
+```{r}
+str(df)
+```
+
+Notre base de données est constituée de 105555 observations et de 30 variables dont certaines sont relatives à la sinistralité (comme le nombre de sinistres survenus au cours de l'année, le cout de sinistres, l'historique de fréquence,..) et d'autres aux caractéristiques du véhicule (comme la puissance, la valeur du véhicule, la capacité de cylindre,..)
+
+Chaque Véhicule est identifié par un contrat repéré par un "ID" et chaque ligne correspond à une situation du risque dans le portefeuille.
+
+####  Analyse des Données
+
+```{r}
+summary(df)
+```
+
+Nous remarquons l'existence de données manquantes au niveau de quelques variables à savoir "Length". Nous vérifions alors ce taux par variable : 
+
+```{r}
+library(ggplot2)
+data_na <- (colSums(is.na(df)) / nrow(df)) * 100
+data_na <- data_na[data_na > 0]  
+data_na <- data.frame(Variable=names(data_na), Missing_Ratio = data.frame(data_na)[,1])
+
+
+# Plot bar chart
+ggplot(data_na, aes(x = Variable, y = Missing_Ratio)) +
+  geom_bar(stat = "identity", fill = "grey", color = "black", alpha = 0.7) +
+  labs(title = "Pourcentage de valeurs manquantes par variable", x = "Variable", y = "Missing Ratio (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Le taux de NA est faible, nous gardons alors toutes les variables.
+
+Partant du fait que la classification des véhicules est basée sur la fréquence (nb de sinistres/exposition), et par soucis de simplicité, nous supposons que l'exposition est égale à une année donc elle prendra la valeur 1. 
+
+```{r}
+
+df$EXPO=1
+```
+
+
+
+#### Zoom sur la Variable "N_claims_year"
+
+
+```{r}
+summary(df$N_claims_year)
+```
+
+
+A partir des statistiques descriptives de la variable N_claims_year, nous remarqueons que :
+
+- Les différents quantiles sont de l'ordre de 0, sauf la moyenne et le quantile Q100 qui est égal à 25.
+
+Dans une première étape, nous isolons l'effet véhicule (cad nous modélisons le nombre de sinistres en fonction des variables qui ne caractérisent pas le véhicule) L'effet de véhicule sera donc incorporé dans les résidus du modèle.
+
+#### Prédiction de la fréquence de sinistres :
+
+L'approche la plus simple est de modéliser le nombre de sinistre par une loi de poisson en utilisant des GLM et en passant l'exposition en offset.
+Cependant, l'évaluation de ce modèle révèle d'une surdispersion. Ceci suggère que la variance est plus grande que celle attendue sous un modèle de Poisson standard. Dans ce cas, le modèle de Poisson peut ne pas être approprié. 
+Nous devrons alors envisager d'autres alternatives. 
+Nous testons des modèles plus complexes comme le gradient boosting machine (GBM).
+
+
+```{r}
+library(gbm)
+gbm_model <- gbm(N_claims_year ~ Premium + Seniority + Policies_in_force + Payment + Area + Type_risk + Max_products + Second_driver, 
+                 distribution = "poisson", data = df, n.trees = 100, interaction.depth = 4, shrinkage = 0.01, cv.folds = 5)
+
+summary(gbm_model)
+```
+
+En fonction des variables sélectionnés, nous remarquons que celles les plus discriminantes sont "Policies in force" correspondant au nombre total de polices détenues par l'assuré auprès de l'entité d'assurance pendant la période, "Premium", "Payment" représentant le mode de paiement et "Type_of_risk".
+
+Par la suite, nous estimons le nombre de sinistres et nous ajoutons cette prédiction comme une variable dans notre base.
+
+```{r}
+# Prédire les sinistres sur les données 
+gbm_predictions <- predict(gbm_model, newdata = df, n.trees = 100, type = "response")
+
+# Ajouter les prédictions dans le dataframe
+df$predicted_claims <- gbm_predictions
+
+# Afficher un résumé des prédictions
+summary(df$predicted_claims)
+
+```
+
+D'après les statistiques descriptives relatives à cette prédiction, nous notons que le nombre de sinistres prédit varie entre 0.3 et 1.43. 
+
+Nous évaluons ce modèle à l'aide de certains indicateurs comme la mesure de déviance et le RMSE. 
+
+```{r}
+# Calcul de la déviance
+deviance <- sum((df$N_claims_year - df$predicted_claims)^2) / nrow(df)
+print(paste("Deviance:", round(deviance, 4)))
+
+# Calcul du RMSE
+rmse <- sqrt(mse <- mean((df$N_claims_year - df$predicted_claims)^2))
+print(paste("RMSE:", round(rmse, 4)))
+```
+
+Par la suite, nous ajoutons une variable correspondant à l'écart entre le nombre de sinistre observé et celui estimé hors effet véhicule.
+
+```{r}
+df$Res_diff=df$N_claims_year - df$predicted_claims
+summary(df$Res_diff)
+boxplot(df$Res_diff)
+
+```
+
+
+
+Ces statistiques donnent un aperçu de la distribution de la variable Res_diff. La moyenne est différente de la médiane, cela suggère la présence de valeurs extrêmes dans la distribution. De plus, le 3ème quantile est inférieur à la moyenne : la distribution est étirée vers la droite (skewness à droite) par les valeurs extrêmes élevées (la valeur maximale du nombre de sinistres résiduel est très élevée par rapport aux autres valeurs).
+
+
+
+Le diagramme à moustaches illustre bien la présence d'outliers. De telles observations peuvent biaiser les résultats, il est donc primordial de les supprimer ou éventuellement de réduire leur taux.
+
+Remarque : dans la partie modélisation, nous comptons tester les modèles avant et après suppression de ces valeurs. 
+
+#### Détection et Suppression des Outliers
+
+##### ) a- Méthode 1 : IQR criterion
+
+Selon cette approche, toutes les observations en dehors de l'intervalle I=[Q1-1.5*IQR ; Q3+1.5*IQR] sont considérées comme des outliers.
+
+```{r}
+
+out <- boxplot.stats(df$Res_diff)$out
+length(out)*100/nrow(df) 
+```
+
+D'après cette méthode, nous avons environ 24% des observations sont considérées comme outliers. Ce taux est élevé, nous testerons alors une autre approche.
+
+##### ) b- Méthode 2 : Percentiles
+
+Cette approche s'appuie sur les percentiles pour identifier les valeurs aberrantes : les observations à l'extérieur de l'intevalle formé par les percentiles 2.5 et 97.5 sont considérées comme des outliers potentiels.
+
+```{r}
+lower_bound1 <- quantile(df$Res_diff, 0.025, na.rm = TRUE)
+upper_bound1 <- quantile(df$Res_diff, 0.975, na.rm=TRUE)
+outlier_ind1 <- which(df$Res_diff < lower_bound1 | df$Res_diff > upper_bound1)
+length(outlier_ind1)*100/nrow(df) 
+summary(df[df$Res_diff >= lower_bound1 & df$Res_diff <= upper_bound1,]$Res_diff)
+
+
+```
+
+5% des valeurs sont considérées comme aberrantes, et le nombre de sinistres résiduel varie entre -0.5 et 3.3. Nous testerons d'autres percentiles pour sélectionner les seuils le plus adéquants en faisant un compromis entre valeurs de seuils (bornes inf et sup de l'intervalle des observations non aberrantes) et taux de valeurs aberrantes (car nous ne pouvons pas supprimer un très grand nombre d'observations). 
+
+Soient alors les percentiles 1 et 99 :
+
+```{r}
+lower_bound2 <- quantile(df$Res_diff, 0.01, na.rm = TRUE)
+upper_bound2 <- quantile(df$Res_diff, 0.99, na.rm = TRUE)
+outlier_ind2 <- which(df$Res_diff < lower_bound2 | df$Res_diff > upper_bound2)
+length(outlier_ind2)*100/nrow(df) #taux
+summary(df[df$Res_diff >= lower_bound2 & df$Res_diff <= upper_bound2,]$Res_diff)
+
+```
+
+Ce taux d'environ 2% semble meilleur, mais l'intervalle des valeurs non aberrantes sera [-0,69 , 4.65]. 
+
+Nous testons, par la suite une autre approche issue de la TVE. Il s'agit de l'estimateur de Hill dont le seuil correspond au moment à partir duquel, cet estimateur ce stabilise.
+
+##### ) c- Méthode 3 : HillPlot
+
+```{r}
+#install.packages("evmix")
+library(evmix)
+hillplot(df$Res_diff) 
+```
+
+D'après le Hillplot, le seuil est fixé à 3.6, cad au dela de cette valeur les observations sont considérées comme extremes. Cette valeur est plus proche de la borne sup du 1er intervalle (les percentiles 2.5 et 97.5 pour lesquels, les observations en dehors de [60.56 , 3.27] sont considérées aberrantes.)
+
+
+```{r}
+# Filtrer les lignes où Res_diff est entre les bornes
+df_filtered <- df[df$Res_diff >= lower_bound1 & df$Res_diff <= upper_bound1, ]
+```
+
+
+
+
+## Etape 1 : Modélisation par GBM
+
+### Avant Suppression des valuers aberrantes
+
+#### Modèle : Variable à expliquer = Res_diff & Offset = EXPO
+
+Nous éliminons les variables de type date et celles fortement corrélées avec le nombre de sinistre comme l'historique de fréquence et nous subdivisons la base en partie train et partie test. 
+
+```{r}
+
+DF=df[,c(1,8:9,14:16, 20:31,33)]
+```
+
+
+#### Split train/test
+
+```{r}
+df=as.h2o(DF)
+splits <- h2o.splitFrame(df, 0.8, seed=1234)  
+train <- h2o.assign(splits[[1]], "train.hex")  
+valid <- h2o.assign(splits[[2]], "valid.hex") 
+```
+
+Par la suite, nous implémentons un modèle de prédiction du nombre de sinistres résiduel via un GBM en mettant l'exposition en offset. 
+
+```{r}
+MOD_1 <- h2o.gbm(x=c(2:17),y = 19, offset_column="EXPO", training_frame = train, validation_frame = valid,ntrees = 50)
+summary(MOD_1)
+```
+
+```{r}
+plot(MOD_1,timestep="number_of_trees",metric="RMSE")
+output1=MOD_1@model$scoring_history
+output1
+```
+
+
+Nous remarquons que les performances sont médiocres à la fois sur les données d'entrainement et de test : les erreurs trains et test sont élevées. Nous avons donc un problème d'underfitting : le modèle ne peut pas capturer la structure sous-jacente des données, ce qui conduit à une mauvaise capacité de généralisation. 
+
+
+
+### Après Suppression des valuers extremes
+
+#### Modèle 2 : Variable à expliquer = Res_diff & Offset = EXPO
+
+
+Nous supprimons les observations considérées comme aberrantes en respectant le seuil choisi dans la partie précédante et nous testons de nouveau le modèle.
+
+```{r}
+DF=df_filtered[,c(1,8:9,14:16, 20:31,33)]
+
+```
+
+
+
+#### Split train/test
+
+```{r}
+h2o.removeAll()
+
+df=as.h2o(DF)
+splits <- h2o.splitFrame(df, 0.8, seed=1234)  
+train <- h2o.assign(splits[[1]], "train.hex")  
+valid <- h2o.assign(splits[[2]], "valid.hex") 
+```
+
+
+```{r}
+MOD_2 <- h2o.gbm(x=c(2:17),y = 19, offset_column="EXPO", training_frame = train, validation_frame = valid,ntrees = 50)
+
+summary(MOD_2) 
+``` 
+
+
+
+```{r}
+plot(MOD_2,timestep="number_of_trees",metric="RMSE")
+output1=MOD_2@model$scoring_history
+output1 
+```
+
+Pour le 2eme modèle, la suppression d'outliers a un impact sur les erreurs (nous détectons une diminution par rapport aux résultats trouvés avant suppression). 
+Le nombre d'arbres pour le tuning est fixé à 20.
+
+
+#### Tuning du modèle 2
+
+```{r}
+gbm_parameters <- list(learn_rate = c(0.01,0.05, 0.1),
+                        max_depth = c(3, 5, 6,7),
+                        sample_rate = c(0.7, 0.75, 0.8),  
+                        col_sample_rate = c(0.2, 0.5, 1.0))
+```
+
+
+```{r}
+gbm2_grid <- h2o.grid("gbm", x=c(2:17),y = 19,
+                      grid_id = "gbm_grid",
+                      training_frame = train,
+                      validation_frame = valid, 
+                      ntrees=20, 
+                      hyper_params = gbm_parameters)
+```
+
+
+```{r}
+gbm2_gridp<- h2o.getGrid(grid_id = "gbm_grid",
+                         sort_by = "rmse",
+                         decreasing  = FALSE)
+print(gbm2_gridp)
+```
+
+#### Modele final 
+Nous retenons le meilleur modèle d'après la grille :
+
+```{r}
+best_MOD=h2o.getModel(gbm2_gridp@model_ids[[1]])
+
+summary(best_MOD)
+```
+
+```{r}
+best_gbm_perf <- h2o.performance(model = best_MOD,newdata = train)
+best_gbm_perf
+```
+
+
+```{r}
+best_gbm_perf <- h2o.performance(model = best_MOD,newdata = valid)
+best_gbm_perf
+```
+
+Le meilleur modèle déterminé à partir de la grille présente des erreurs train et test plus faibles que ceux issus du 1er modèle et proches l'un de l'autre, donc nous n'avons ni un sous ni un sur-apprentissage.
+Nous confirmons également que la suppression des valeurs aberrantes améliorent les performances du modèle.
+
+```{r}
+
+h2o.varimp_plot(best_MOD)
+```
+
+## Etape 2 : Construction du véhiculier
+
+Dans cette partie, nous aurons recours à l'un des algorithmes de classification non supervisé qui est le kmeans pour regrouper les prédictions en classes de risques homogènes.
+
+
+
+#### Méthode de coude pour le choix du nombre de clusters 
+
+```{r}
+# Charger les librairies
+library(cluster)
+library(factoextra)
+
+# Plage de valeurs pour le nombre de clusters
+k_range = 2:15
+
+# Sélection des colonnes non numériques et celles sans valeurs manquantes
+non_num_col = names(df_filtered)[!sapply(df_filtered, is.numeric)]
+non_num_col_mis = non_num_col[!apply(df_filtered[non_num_col], 2, function(x) any(is.na(x)))]
+
+# Filtrer les colonnes numériques et omettre les NA
+DF_num = na.omit(DF[, sapply(DF, is.numeric)])
+
+# Appliquer K-means sur les colonnes numériques sans NA
+kmeans_models = lapply(k_range, function(k) {
+  kmeans(DF_num, centers = k, nstart = 25)  # Utiliser nstart pour des résultats plus stables
+})
+
+# Calculer la somme des carrés intra-cluster pour chaque modèle
+wss = sapply(kmeans_models, function(model) sum(model$withinss))
+
+# Tracer le graphique de la somme des carrés intra-cluster en fonction du nombre de clusters
+plot(k_range, wss, type = 'b', pch = 19, frame = FALSE, 
+     xlab = 'Nombre de clusters', ylab = 'Somme des carrés intra-cluster (WSS)')
+
+```
+
+
+D'après la courbe Elbow (méthode de coude), le nombre optimal de clusters est k=7.
+
+Nous appliquons alors l'algorithme de kmeans en fixant le nb de cluters à 7
+
+#### Kmeans appliqué au modele 
+
+
+```{r}
+df2=df
+B=h2o.predict(best_MOD, df2)
+pred=as.vector(as.numeric(B))
+DF$EFFET_V=pred
+```
+
+
+```{r}
+scaled_pred=scale(DF$EFFET_V)
+k_res=kmeans(scaled_pred, centers=7)
+VEHICULIER=k_res$cluster
+DF$VEHICULIER=VEHICULIER
+```
+
+#### Visualisation des Résultats de Classification Kmeans pour le 2eme modèle
+
+
+
+```{r}
+library(ggplot2)
+
+
+sum_freq_res <- aggregate(DF$Res_diff, by = list(VEHICULIER), sum)
+
+# Renommer les colonnes pour plus de clarté
+colnames(sum_freq_res) <- c("VEHICULIER", "Total_freq_res")
+
+# Tracer l'histogramme
+ggplot(sum_freq_res, aes(x = factor(VEHICULIER), y = Total_freq_res, fill = factor(VEHICULIER))) +
+  geom_bar(stat = "identity") +
+  labs(title = "Somme de Res_diff par VEHICULIER",
+       x = "VEHICULIER",
+       y = "Somme de Res_diff") +
+  theme_minimal()
+```
+
